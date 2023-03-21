@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# recording data
+*.mat
+
 # C extensions
 *.so
 
