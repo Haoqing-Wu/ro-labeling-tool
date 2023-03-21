@@ -5,6 +5,8 @@ __pycache__/
 
 # recording data
 *.mat
+*.dat
+*.hdf5
 
 # C extensions
 *.so
