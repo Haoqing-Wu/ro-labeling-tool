@@ -5,13 +5,17 @@ import numpy as np
 
 TIME_STEP = 0.04  # Time span of MDF/ADTF signal scan
 NR_OF_RAW_MAINPATH_POINTS = 40
+NR_OF_CAMERA_ACTORS = 20
+NO_ACTOR = 255.0
 
 class MatLoader:
     def __init__(self, args):
         self.args = args
-        self.generator = EMLFromMat()
+        self.ego_generator = EMLFromMat()
+        self.actor_generator = OGMFromMat()
         self.signals = {}
         self.ego_paths = []
+        self.actor_paths = []
         self.high = 0
         self.current = args.start_frame
         self.fpi = int(args.range / TIME_STEP)  # Frame per iteration: number of frames will be calculated in one iter
@@ -40,38 +44,67 @@ class MatLoader:
     def generate_ego_paths(self):
         for idx in range(self.high):
             if self.current + self.fpi < self.high:
-                mp_mock, compen_xy = compute_mock(self._make_signal_path())
+                mp_mock, compen_xy = compute_mock(self.make_signal_ego_path())
                 self.ego_paths.append(mp_mock)
                 self.current += 1
             else:
+                self.current = 0
                 break
-        print("size of ego paths: {}".format(self.ego_paths))
+        print("size of ego paths: {}".format(len(self.ego_paths)))
 
-    def _make_signal_path(self):
+    def generate_actor_paths(self):
+
+        self.actor_paths = self.make_signal_actor_path()
+        print("size of actors paths: {}".format(len(self.actor_paths)))
+
+    def collect_signal(self, idx, signals):
         found = self.signals.keys()
+        frames = []
+        for id, _type in signals:
+            if id in found and idx <= len(self.signals[id]):
+                frames.append(self.signals[id][idx][0])
+            else:
+                # signal is present in the ADTF mapping but not in the export file
+                # or it has less frames than expected (requested). Either way, we use zero
+                frames.append(0)
+        return frames
 
-        def collect_signal(idx, signals):
-            frames = []
-            for id, _type in signals:
-                if id in found and idx <= len(self.signals[id]):
-                    frames.append(self.signals[id][idx][0])
-                else:
-                    # signal is present in the ADTF mapping but not in the export file
-                    # or it has less frames than expected (requested). Either way, we use zero
-                    frames.append(0)
-            return frames
-
+    def make_signal_ego_path(self):
         start = self.current
         stop = self.current + self.fpi
         stop = min(stop, self.signals_length)
-        path_data = []
+        ego_path_data = []
         for idx in range(start, stop):
-            data = collect_signal(idx, self.generator.signals)
-            path_data.append(data)
+            data = self.collect_signal(idx, self.ego_generator.signals)
+            ego_path_data.append(data)
 
-        path = self.generator.compute_path(path_data)
-
+        path = self.ego_generator.compute_path(ego_path_data)
         return path
+
+    def make_signal_actor_path(self):
+        actors_path_data = []
+        id_prev = self.collect_signal(0, self.actor_generator.signals)[0]
+        cursor = 1
+        while cursor < self.high:
+            actor_path_data = []
+            if id_prev == NO_ACTOR:
+                data = self.collect_signal(cursor, self.actor_generator.signals)
+                id_prev = data[0]
+            else:
+                for idx in range(cursor, self.high - 1):
+                    data = self.collect_signal(idx, self.actor_generator.signals)
+                    if data[0] == id_prev:
+                        id_prev = data[0]
+                        data.insert(0, idx)
+                        actor_path_data.append(data)
+                    else:
+                        id_prev = data[0]
+                        actors_path_data.append(actor_path_data)
+                        cursor = idx
+                        break
+            cursor += 1
+
+        return actors_path_data
 
 
 class EMLFromMat:
@@ -131,6 +164,13 @@ class EMLFromMat:
                ]
            )
         return main_path
+
+
+class OGMFromMat:
+    def __init__(self):
+        self.signals = []
+        self.signals.append(('BV2_Obj_06_ID', float))
+        self.signals.append(('BV2_Obj_06_Klasse', float))
 
 
 def local2world(position, prev_pos, data, idx_elem):
