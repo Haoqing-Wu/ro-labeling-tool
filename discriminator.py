@@ -16,5 +16,5 @@ if __name__ == '__main__':
     args = parser.parse_args()
     mat_loader = MatLoader(args)
     mat_loader.generate_ego_paths()
-    mat_loader.generate_actor_paths()
+    mat_loader.generate_actors_paths()
 

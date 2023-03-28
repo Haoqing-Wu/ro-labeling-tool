@@ -15,7 +15,7 @@ class MatLoader:
         self.actor_generator = OGMFromMat()
         self.signals = {}
         self.ego_paths = []
-        self.actor_paths = []
+        self.actors_paths = []
         self.high = 0
         self.current = args.start_frame
         self.fpi = int(args.range / TIME_STEP)  # Frame per iteration: number of frames will be calculated in one iter
@@ -52,10 +52,10 @@ class MatLoader:
                 break
         print("size of ego paths: {}".format(len(self.ego_paths)))
 
-    def generate_actor_paths(self):
+    def generate_actors_paths(self):
 
-        self.actor_paths = self.make_signal_actor_path()
-        print("size of actors paths: {}".format(len(self.actor_paths)))
+        self.actors_paths = self.make_signal_actor_path()
+        print("size of actors paths: {}".format(len(self.actors_paths)))
 
     def collect_signal(self, idx, signals):
         found = self.signals.keys()
@@ -169,8 +169,12 @@ class EMLFromMat:
 class OGMFromMat:
     def __init__(self):
         self.signals = []
-        self.signals.append(('BV2_Obj_06_ID', float))
-        self.signals.append(('BV2_Obj_06_Klasse', float))
+        self.signals.append(('BV2_Obj_01_ID', float))
+        self.signals.append(('BV2_Obj_01_Klasse', float))
+        self.signals.append(('BV2_Obj_01_PositionX', float))
+        self.signals.append(('BV2_Obj_01_PositionY', float))
+        self.signals.append(('BV2_Obj_01_GeschwX', float))
+        self.signals.append(('BV2_Obj_01_GeschwY', float))
 
 
 def local2world(position, prev_pos, data, idx_elem):
