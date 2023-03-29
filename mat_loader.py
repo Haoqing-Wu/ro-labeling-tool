@@ -1,12 +1,17 @@
 import glob
+import itertools
 import sys
 import scipy.io as sio
-import numpy as np
+import utils
+from tqdm import tqdm
+
 
 TIME_STEP = 0.04  # Time span of MDF/ADTF signal scan
 NR_OF_RAW_MAINPATH_POINTS = 40
-NR_OF_CAMERA_ACTORS = 20
-NO_ACTOR = 255.0
+NR_OF_CAMERA_ACTORS = 10
+NR_OF_LRR_ACTORS = 20
+NO_ACTOR = 255.0 # No actor is present then the ID from sensor will be 255
+FRAGMENT_LENGTH = 4.0  # [s] length of the fragment which will be labeled
 
 class MatLoader:
     def __init__(self, args):
@@ -42,26 +47,45 @@ class MatLoader:
         print('{} frames of signal are loaded'.format(self.signals_length))
 
     def generate_ego_paths(self):
-        for idx in range(self.high):
-            if self.current + self.fpi < self.high:
-                mp_mock, compen_xy = compute_mock(self.make_signal_ego_path())
-                self.ego_paths.append(mp_mock)
-                self.current += 1
-            else:
-                self.current = 0
-                break
-        print("size of ego paths: {}".format(len(self.ego_paths)))
+
+        print("Generate Ego trajectories for each frame.")
+        for idx in tqdm(range(self.high - self.fpi)):
+            mp_mock, compen_xy = utils.compute_mock(self.make_signal_ego_path())
+            self.ego_paths.append(mp_mock)
 
     def generate_actors_paths(self):
 
-        self.actors_paths = self.make_signal_actor_path()
-        print("size of actors paths: {}".format(len(self.actors_paths)))
+        print("Generate Actors trajectories from BV2.")
+        paths = []
+        for object_id in tqdm(range(NR_OF_CAMERA_ACTORS)):
+            paths.append(self.make_signal_actor_path(object_id, 'BV2'))
+        self.actors_paths = list(itertools.chain.from_iterable(paths))
+        print("Size of BV2 actors path fragment: {}".format(len(self.actors_paths)))
 
-    def collect_signal(self, idx, signals):
+    def collect_ego_signal(self, idx, signals):
         found = self.signals.keys()
         frames = []
         for id, _type in signals:
             if id in found and idx <= len(self.signals[id]):
+                frames.append(self.signals[id][idx][0])
+            else:
+                # signal is present in the ADTF mapping but not in the export file
+                # or it has less frames than expected (requested). Either way, we use zero
+                frames.append(0)
+        return frames
+    
+    def collect_actor_signal(self, idx, signals, object_id):
+        """
+        Collects the actor data from the mat file and returns a list of paths
+        :param idx: index of the frame
+        :param signals: list of signals
+        :param object_id: id of the actor
+        :return: list of paths
+        """
+        found = self.signals.keys()
+        frames = []
+        for id, _type in signals[object_id]:
+            if id in found and idx < len(self.signals[id]):
                 frames.append(self.signals[id][idx][0])
             else:
                 # signal is present in the ADTF mapping but not in the export file
@@ -75,36 +99,49 @@ class MatLoader:
         stop = min(stop, self.signals_length)
         ego_path_data = []
         for idx in range(start, stop):
-            data = self.collect_signal(idx, self.ego_generator.signals)
+            data = self.collect_ego_signal(idx, self.ego_generator.signals)
             ego_path_data.append(data)
 
         path = self.ego_generator.compute_path(ego_path_data)
         return path
 
-    def make_signal_actor_path(self):
+    def make_signal_actor_path(self, object_id, sensor):
+        """
+        Collects the actor data from the mat file and returns a list of paths
+        :param object_id: id of the actor
+        :return: list of paths
+        """
         actors_path_data = []
-        id_prev = self.collect_signal(0, self.actor_generator.signals)[0]
+        
+        mask = self.actor_generator.signals[sensor]
+        id_prev = self.collect_actor_signal(0, mask, object_id)[0]
         cursor = 1
         while cursor < self.high:
             actor_path_data = []
             if id_prev == NO_ACTOR:
-                data = self.collect_signal(cursor, self.actor_generator.signals)
+                data = self.collect_actor_signal(cursor, mask, object_id) # get the next actor
                 id_prev = data[0]
             else:
                 for idx in range(cursor, self.high - 1):
-                    data = self.collect_signal(idx, self.actor_generator.signals)
-                    if data[0] == id_prev:
+                    data = self.collect_actor_signal(idx, mask, object_id)
+                    if data[0] == id_prev: # same actor
                         id_prev = data[0]
                         data.insert(0, idx)
                         actor_path_data.append(data)
-                    else:
-                        id_prev = data[0]
-                        actors_path_data.append(actor_path_data)
+                        # if the length of the fragment is reached then truncate the path
+                        if len(actor_path_data) >= FRAGMENT_LENGTH / TIME_STEP: # 4 seconds , 100 frames
+                            actors_path_data.append(actor_path_data)
+                            cursor = idx
+                            break
+                    else: # new actor
+                        id_prev = data[0] # update id
+                        # actors_path_data.append(actor_path_data)
                         cursor = idx
                         break
             cursor += 1
 
         return actors_path_data
+
 
 
 class EMLFromMat:
@@ -134,8 +171,8 @@ class EMLFromMat:
         """
 
         # convert XY points to world coordinates, x_wc - x world coord
-        x_wc = local2world(self.position_x, self.prev_x, data, 0) # 'EML_PositionX'
-        y_wc = local2world(self.position_y, self.prev_y, data, 1) # 'EML_PositionY'
+        x_wc = utils.local2world(self.position_x, self.prev_x, data, 0) # 'EML_PositionX'
+        y_wc = utils.local2world(self.position_y, self.prev_y, data, 1) # 'EML_PositionY'
 
         self.prev_x, self.prev_y = data[0][0], data[0][1]
         self.position_x, self.position_y = x_wc[0], y_wc[0]
@@ -168,101 +205,27 @@ class EMLFromMat:
 
 class OGMFromMat:
     def __init__(self):
-        self.signals = []
-        self.signals.append(('BV2_Obj_01_ID', float))
-        self.signals.append(('BV2_Obj_01_Klasse', float))
-        self.signals.append(('BV2_Obj_01_PositionX', float))
-        self.signals.append(('BV2_Obj_01_PositionY', float))
-        self.signals.append(('BV2_Obj_01_GeschwX', float))
-        self.signals.append(('BV2_Obj_01_GeschwY', float))
+        self.bv2_signals = [[
+            ('BV2_Obj_{:0>2d}_ID'.format(i), float),
+            ('BV2_Obj_{:0>2d}_Klasse'.format(i), float),
+            ('BV2_Obj_{:0>2d}_PositionX'.format(i), float),
+            ('BV2_Obj_{:0>2d}_PositionY'.format(i), float),
+            ('BV2_Obj_{:0>2d}_GeschwX'.format(i), float),
+            ('BV2_Obj_{:0>2d}_GeschwY'.format(i), float),
+        ] for i in range(1, 11)]
+        
+        self.LRR1_signals = [[
+            ('LRR1_Obj_{:0>2d}_ID_UF'.format(i), float),
+            ('LRR1_Obj_{:0>2d}_Klasse_UF'.format(i), float),
+            ('LRR1_Obj_{:0>2d}_RadialDist_UF'.format(i), float),
+            ('LRR1_Obj_{:0>2d}_AzimutWnkl_UF'.format(i), float),
+            ('LRR1_Obj_{:0>2d}_GierWnkl_UF'.format(i), float),
+            ('LRR1_Obj_{:0>2d}_RadialGeschw_UF'.format(i), float),
+        ] for i in range(1, 21)]
+
+        self.signals = {
+            'BV2': self.bv2_signals,
+            'LRR1': self.LRR1_signals
+        }
 
 
-def local2world(position, prev_pos, data, idx_elem):
-    """
-    Compute absolute positions for EML on X,Y
-    :param position:
-    :param prev:
-    :param data: segment data provided in USK
-    :param idx_elem: 0 - EML X, 1 - EML Y
-    :return:
-    """
-    position_world = []
-    for idx in range(len(data)):
-        cur_pos = data[idx][idx_elem]
-        delta = cur_pos - prev_pos
-        compensate = 0
-        if delta < -8:
-            compensate = 16
-        elif delta > 8:
-            compensate = -16
-        position += (delta + compensate)
-        position_world.append(position)
-        prev_pos = cur_pos
-
-    return position_world
-
-
-def get_relative_coord(origin, points):
-    """
-    Get pose (x, y, yaw) relative to a given origin, yaw normalized to [-pi,+pi]
-
-    The angle should be given in radians.
-    :param points: vector of points
-    :param origin: origin point
-    :return: vector of points
-    """
-    ox, oy, oyaw = origin
-    px, py, pyaw = np.array(points[0]), np.array(points[1]), np.array(points[2])
-
-    # points coordinates relative to origin
-    x_rel = np.cos(oyaw) * (px - ox) + np.sin(oyaw) * (py - oy)
-    y_rel = -np.sin(oyaw) * (px - ox) + np.cos(oyaw) * (py - oy)
-    yaw_rel = np.arctan2(np.sin(pyaw - oyaw), np.cos(pyaw - oyaw))  # limit to plus/minus pi
-
-    x, y = get_global_coord([ox, oy, oyaw], [x_rel, y_rel])
-
-    return x_rel, y_rel, yaw_rel, [x, y]
-
-
-def get_global_coord(global_p, local_p):
-    """
-
-    :param origin:
-    :param points:
-    :return:
-    """
-
-    ox, oy, oyaw = global_p
-    px, py  = np.array(local_p[0]), np.array(local_p[1])
-
-    x_global = np.cos(oyaw) * px - np.sin(oyaw) * py + ox
-    y_global = np.sin(oyaw) * px + np.cos(oyaw) * py + oy
-
-    return x_global, y_global
-
-
-def compute_mock(ego_groundtruth):
-    """
-    Convert to USK(ego) frame of reference
-    1 - EML X, 2 - EML Y, 3 - EML YAW
-    :param ego_groundtruth:
-    :return:
-    """
-    # origin coord
-    ox, oy, oyaw = ego_groundtruth[0][1], ego_groundtruth[0][2], ego_groundtruth[0][3]
-    # get all the points from segment(segment represented by prediction horizon)
-    x =   [ego_groundtruth[elem][1] for elem in range(len(ego_groundtruth))]
-    y =   [ego_groundtruth[elem][2] for elem in range(len(ego_groundtruth))]
-    yaw = [ego_groundtruth[elem][3] for elem in range(len(ego_groundtruth))]
-
-    # compen_xy represent the global coordinates computed from relative coordinates
-    x_rel, y_rel, yaw_rel, compen_xy = get_relative_coord([ox, oy, oyaw], [x, y, yaw])
-
-    mp_mock = ego_groundtruth
-    for idx in range(ego_groundtruth.__len__()):
-        mp_mock[idx][1] = x_rel[idx]
-        mp_mock[idx][2] = y_rel[idx]
-        mp_mock[idx][3] = yaw_rel[idx]
-        mp_mock[idx].append(0.0)  # dtrack - covered distance at node; unit [m] - not used at the moment
-
-    return mp_mock, compen_xy
