@@ -1,4 +1,6 @@
 import numpy as np
+import pandas as pd
+import math
 
 
 def local2world(position, prev_pos, data, idx_elem):
@@ -21,7 +23,7 @@ def local2world(position, prev_pos, data, idx_elem):
             compensate = -16
         position += (delta + compensate)
         position_world.append(position)
-        prev_pos = cur_pos
+        prev_pos = cur_pos 
 
     return position_world
 
@@ -90,3 +92,190 @@ def compute_mock(ego_groundtruth):
         mp_mock[idx].append(0.0)  # dtrack - covered distance at node; unit [m] - not used at the moment
 
     return mp_mock, compen_xy
+
+def array_to_dataframe(array):
+    return pd.DataFrame(array, columns=['time', 'id', 'type', 'ref_point', 'width', 'length', 'height', 'pos_x',
+                                            'pos_y','vel_x', 'vel_y', 'yaw'])
+
+
+def set_compensation(obj):
+
+    def set_offset(compen_x, compen_y, type):
+        points = [{} for i in range(0, 3)]
+        for i in range(0, 3):
+            points[i]['pos_x'] = obj['pos_x'] + compen_x[i]
+            points[i]['pos_y'] = obj['pos_y'] + compen_y[i]
+            points[i]['pos_z'] = obj['pos_z']
+            points[i]['height'] = obj['height']
+            points[i]['type'] = type[i]
+        
+        return points
+        
+    if obj['ref_point'] == 1.0: # front left
+        spherical = set_offset([0.0, 0.0, obj['length']], [0.0, obj['width'], 0.0], 
+                                ['front_left', 'front_right', 'rear_left'])
+    elif obj['ref_point'] == 14.0: #front left upper point
+        spherical = set_offset([0.0, 0.0, obj['length']], [0.0, obj['width'], 0.0], 
+                                ['front_left', 'front_right', 'rear_left'])
+    elif obj['ref_point'] == 2.0: # front center
+        spherical = set_offset([0.0, 0.0, obj['length']], 
+                                [-0.5 * obj['width'], 0.5 * obj['width'], -0.5 * obj['width']], 
+                                ['front_left', 'front_right', 'rear_left'])
+    elif obj['ref_point'] == 3.0: # front right
+        spherical = set_offset([0.0, 0.0, obj['length']], [0.0, -obj['width'], 0.0], 
+                                ['front_right', 'front_left', 'rear_right'])
+    elif obj['ref_point'] == 15.0: # front right upper point
+        spherical = set_offset([0.0, 0.0, obj['length']], [0.0, -obj['width'], 0.0], 
+                                ['front_right', 'front_left', 'rear_right'])
+    elif obj['ref_point'] == 4.0: # middle right
+        spherical = set_offset([-0.5 * obj['length'], -0.5 * obj['length'], 0.5 * obj['length']], 
+                                [0.0, -obj['width'], 0.0], 
+                                ['front_right', 'front_left', 'rear_right'])
+    elif obj['ref_point'] == 5.0: # rear right
+        spherical = set_offset([0.0, 0.0, obj['length']], [0.5, obj['width'], 0.0], 
+                                ['rear_right', 'rear_left', 'front_right'])
+    elif obj['ref_point'] == 12.0: # rear right upper point
+        spherical = set_offset([0.0, 0.0, obj['length']], [0.5, obj['width'], 0.0], 
+                                ['rear_right', 'rear_left', 'front_right'])
+    elif obj['ref_point'] == 11.0: # arbitrary point corner
+        spherical = set_offset([0.0, 0.0, obj['length']], 
+                                [-0.5 * obj['width'], 0.5 * obj['width'], -0.5 * obj['width']], 
+                                ['rear_right', 'rear_center', 'rear_left'])
+    elif obj['ref_point'] == 6.0: # rear center
+        spherical = set_offset([0.0, 0.0, obj['length']], 
+                               [-0.5 * obj['width'], 0.5 * obj['width'], -0.5 * obj['width']], 
+                                ['rear_right', 'rear_left', 'front_right'])
+    elif obj['ref_point'] == 10.0: # arbitrary side 
+        spherical = set_offset([0.0, 0.0, obj['length']], 
+                                [-0.5 * obj['width'], 0.5 * obj['width'], -0.5 * obj['width']], 
+                                ['rear_right', 'rear_left', 'front_right'])
+    elif obj['ref_point'] == 7.0: # rear left
+        spherical = set_offset([0.0, 0.0, obj['length']], [0.0, -obj['width'], 0.0], 
+                                ['rear_left', 'rear_right', 'front_left'])
+    elif obj['ref_point'] == 13.0: # rear left upper point
+        spherical = set_offset([0.0, 0.0, obj['length']], [0.0, -obj['width'], 0.0], 
+                                ['rear_left', 'rear_right', 'front_left'])
+    elif obj['ref_point'] == 8.0: # middle left
+        spherical = set_offset([-0.5 * obj['length'], -0.5 * obj['length'], 0.5 * obj['length']], 
+                                [0.0, obj['width'], 0.0], 
+                                ['front_left', 'front_right', 'rear_left'])
+    elif obj['ref_point'] == 9.0: # middle center
+        spherical = set_offset([-0.5 * obj['length'], -0.5 * obj['length'], 0.5 * obj['length']], 
+                                [-0.5 * obj['width'], 0.5 * obj['width'], 0.5 * obj['width']], 
+                                ['front_left', 'front_right', 'rear_right'])
+    else :
+        spherical = set_offset([0.0, 0.0, -obj['length']], 
+                               [-0.5 * obj['width'], 0.5 * obj['width'], -0.5 * obj['width']], 
+                                ['rear_right', 'rear_left', 'front_right'])
+
+    return spherical
+
+def ref_compensation(obj, yaw):
+
+    position = [obj['pos_x'], obj['pos_y']]
+    if obj['ref_point'] == 10.0: # some edge
+        position = recalculate_ref_point(obj, yaw, 0.0, 0.0)
+    elif obj['ref_point'] == 1.0: # front left
+        position = recalculate_ref_point(obj, yaw, -0.5, -0.5)
+    elif obj['ref_point'] == 2.0: # front middle
+        position = recalculate_ref_point(obj, yaw, -0.5, 0.0)
+    elif obj['ref_point'] == 3.0: # front right
+        position = recalculate_ref_point(obj, yaw, -0.5, 0.5)
+    elif obj['ref_point'] == 4.0: # middle right
+        position = recalculate_ref_point(obj, yaw, 0.0, 0.5)
+    elif obj['ref_point'] == 5.0: # rear right
+        pass
+    elif obj['ref_point'] == 11.0: # some corner
+        position = recalculate_ref_point(obj, yaw, 0.5, 0.5)
+    elif obj['ref_point'] == 7.0: # rear left
+        position = recalculate_ref_point(obj, yaw, 0.5, -0.5)
+    elif obj['ref_point'] == 8.0: # middle left
+        position = recalculate_ref_point(obj, yaw, 0.0, -0.5)
+    elif obj['ref_point'] == 9.0: # middle rear
+        position = recalculate_ref_point(obj, yaw, 0.5, 0.0)
+    else:
+        pass
+    return position
+
+def recalculate_ref_point(obj, yaw, fx, fy):
+    position = [obj['pos_x'], obj['pos_y']]
+    position[0] = obj['pos_x'] + fx * obj['length'] * math.cos(yaw) - fy * obj['width'] * math.sin(yaw)
+    position[1] = obj['pos_y'] + fx * obj['length'] * math.sin(yaw) + fy * obj['width'] * math.cos(yaw)
+    return position
+
+def min_element(array, key):
+    min = array[0]
+    for i in range(0, len(array)):
+        if array[i][key] < min[key]:
+            min = array[i]
+    return min
+
+def polar_to_cartesian(point):
+    return [point['distance'] * math.cos(point['azimuth']) * math.sin(point['elevation']),
+            point['distance'] * math.sin(point['azimuth']) * math.sin(point['elevation']),]
+
+def points_on_same_side(p1, p2):
+    if p1 == 'front_left' and p2 == 'rear_left':
+        return True
+    elif p1 == 'front_right' and p2 == 'rear_right':
+        return True
+    elif p1 == 'front_center' and p2 == 'rear_center':
+        return True
+    else:
+        return False
+    
+def points_on_same_layer(p1, p2):
+    if p1 == 'front_left' and p2 == 'front_right':
+        return True
+    elif p1 == 'front_right' and p2 == 'front_center':
+        return True
+    elif p1 == 'front_left' and p2 == 'front_center':
+        return True
+    elif p1 == 'rear_right' and p2 == 'rear_left':
+        return True
+    elif p1 == 'rear_left' and p2 == 'rear_center':
+        return True
+    elif p1 == 'rear_right' and p2 == 'rear_center':
+        return True
+    else:
+        return False
+
+def sort_points(p1, p2, order):
+    if order == 'front_to_rear':
+        if p1['type'] == 'front_left' and p2['type'] == 'rear_left':
+            return [p1, p2]
+        elif p1['type'] == 'front_right' and p2['type'] == 'rear_right':
+            return [p1, p2]	
+        elif p1['type'] == 'front_center' and p2['type'] == 'rear_center':
+            return [p1, p2]
+        elif p1['type'] == 'rear_left' and p2['type'] == 'front_left':
+            return [p2, p1]
+        elif p1['type'] == 'rear_right' and p2['type'] == 'front_right':
+            return [p2, p1]
+        elif p1['type'] == 'rear_center' and p2['type'] == 'front_center':
+            return [p2, p1]
+    elif order == 'left_to_right':
+        if p1['type'] == 'front_left' and p2['type'] == 'front_right':
+            return [p1, p2]
+        elif p1['type'] == 'front_right' and p2['type'] == 'front_center':
+            return [p2, p1]
+        elif p1['type'] == 'front_left' and p2['type'] == 'front_center':
+            return [p1, p2]
+        elif p1['type'] == 'rear_right' and p2['type'] == 'rear_left':
+            return [p2, p1]
+        elif p1['type'] == 'rear_left' and p2['type'] == 'rear_center':
+            return [p1, p2]
+        elif p1['type'] == 'rear_right' and p2['type'] == 'rear_center':
+            return [p2, p1]
+        elif p1['type'] == 'front_right' and p2['type'] == 'front_left':
+            return [p2, p1]
+        elif p1['type'] == 'front_center' and p2['type'] == 'front_right':
+            return [p1, p2]
+        elif p1['type'] == 'front_center' and p2['type'] == 'front_left':
+            return [p2, p1]
+        elif p1['type'] == 'rear_left' and p2['type'] == 'rear_right':
+            return [p1, p2]
+        elif p1['type'] == 'rear_center' and p2['type'] == 'rear_left':
+            return [p2, p1]
+        elif p1['type'] == 'rear_center' and p2['type'] == 'rear_right':
+            return [p1, p2]

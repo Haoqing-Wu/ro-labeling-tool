@@ -3,15 +3,18 @@ import itertools
 import sys
 import scipy.io as sio
 import utils
+import math
 from tqdm import tqdm
+import pandas as pd
 
 
 TIME_STEP = 0.04  # Time span of MDF/ADTF signal scan
-NR_OF_RAW_MAINPATH_POINTS = 40
+NR_OF_RAW_MAINPATH_POINTS = 100
 NR_OF_CAMERA_ACTORS = 10
 NR_OF_LRR_ACTORS = 20
 NO_ACTOR = 255.0 # No actor is present then the ID from sensor will be 255
 FRAGMENT_LENGTH = 4.0  # [s] length of the fragment which will be labeled
+RADAR_OBJ_MAX_VEL = 127.875  # [m/s] max velocity of the object in the radar
 
 class MatLoader:
     def __init__(self, args):
@@ -48,19 +51,38 @@ class MatLoader:
 
     def generate_ego_paths(self):
 
-        print("Generate Ego trajectories for each frame.")
+        print("Generate Ego trajectories for each frame.") 
+
         for idx in tqdm(range(self.high - self.fpi)):
             mp_mock, compen_xy = utils.compute_mock(self.make_signal_ego_path())
-            self.ego_paths.append(mp_mock)
+            self.ego_paths.append(pd.DataFrame(mp_mock, columns=['time', 'pos_x', 'pos_y', 
+                                                              'yaw', 'curv', 'vel_t', 'acc_t', 
+                                                              'distance']))
 
     def generate_actors_paths(self):
 
         print("Generate Actors trajectories from BV2.")
         paths = []
-        for object_id in tqdm(range(NR_OF_CAMERA_ACTORS)):
-            paths.append(self.make_signal_actor_path(object_id, 'BV2'))
-        self.actors_paths = list(itertools.chain.from_iterable(paths))
-        print("Size of BV2 actors path fragment: {}".format(len(self.actors_paths)))
+        for id in tqdm(range(NR_OF_CAMERA_ACTORS)):
+            self.actors_paths.extend(self.make_signal_actor_path(id, 'BV2'))
+
+        print("Generate Actors trajectories from LRR1.")
+        for id in tqdm(range(NR_OF_LRR_ACTORS)):
+            self.actors_paths.extend(self.make_signal_actor_path(id, 'LRR1'))
+        
+        print("Actor trajectories are generated. Total number of useful paths: {}".format(len(self.actors_paths)))
+
+    def collect_sensor_config(self, sensor):
+        found = self.signals.keys()
+        conf = []
+        for id, _type in sensor:
+            if id in found :
+                conf.append(self.signals[id][0][0])
+            else:
+                # signal is present in the ADTF mapping but not in the export file
+                # or it has less frames than expected (requested). Either way, we use zero
+                conf.append(0)
+        return conf
 
     def collect_ego_signal(self, idx, signals):
         found = self.signals.keys()
@@ -82,6 +104,7 @@ class MatLoader:
         :param object_id: id of the actor
         :return: list of paths
         """
+
         found = self.signals.keys()
         frames = []
         for id, _type in signals[object_id]:
@@ -94,6 +117,7 @@ class MatLoader:
         return frames
 
     def make_signal_ego_path(self):
+
         start = self.current
         stop = self.current + self.fpi
         stop = min(stop, self.signals_length)
@@ -105,17 +129,25 @@ class MatLoader:
         path = self.ego_generator.compute_path(ego_path_data)
         return path
 
-    def make_signal_actor_path(self, object_id, sensor):
+    def make_signal_actor_path(self, object_id, sensor): 
+
+        actors_path_data = self.truncate_actor_signal(sensor, object_id)
+        actors_trajectory = self.get_trajectory_based_on_front(actors_path_data)
+
+        return actors_trajectory
+
+    def truncate_actor_signal(self, sensor, object_id, length=FRAGMENT_LENGTH):
         """
-        Collects the actor data from the mat file and returns a list of paths
+        Truncates the actor signal to the length of the fragment
         :param object_id: id of the actor
+        :param sensor: sensor type
         :return: list of paths
         """
         actors_path_data = []
-        
         mask = self.actor_generator.signals[sensor]
         id_prev = self.collect_actor_signal(0, mask, object_id)[0]
         cursor = 1
+
         while cursor < self.high:
             actor_path_data = []
             if id_prev == NO_ACTOR:
@@ -126,23 +158,214 @@ class MatLoader:
                     data = self.collect_actor_signal(idx, mask, object_id)
                     if data[0] == id_prev: # same actor
                         id_prev = data[0]
-                        data.insert(0, idx)
+                        data.insert(0, idx - 1)
+
+                        data = self.extract_features(data, sensor)
+
                         actor_path_data.append(data)
                         # if the length of the fragment is reached then truncate the path
-                        if len(actor_path_data) >= FRAGMENT_LENGTH / TIME_STEP: # 4 seconds , 100 frames
-                            actors_path_data.append(actor_path_data)
+                        if len(actor_path_data) >= length / TIME_STEP: # 4 seconds , 100 frames
+                            actors_path_data.append(utils.array_to_dataframe(actor_path_data))
                             cursor = idx
                             break
                     else: # new actor
                         id_prev = data[0] # update id
-                        # actors_path_data.append(actor_path_data)
                         cursor = idx
                         break
             cursor += 1
 
         return actors_path_data
+    
+    def extract_features(self, data, sensor='BV2'):
+
+        sensor_config = self.collect_sensor_config(self.actor_generator.conf[sensor])
+        if sensor == 'BV2':
+            ref_point = self.create_cam_ref_point(data, sensor_config)
+            spherical = self.get_spherical_points(ref_point, sensor_config)
+            actor = self.calculate_from_points(ref_point, spherical, sensor_config)
+        elif sensor == 'LRR1':
+            actor = self.get_radar_actor(data, sensor_config)
+        return actor
+
+    def create_cam_ref_point(self, data, sensor_config):
+        ref_point = {
+            'idx': data[0],
+            'id': data[1],
+            'type': data[2],
+            'ref_point': data[3],
+            'width': data[4],
+            'length': 0.0,
+            'height': 0.0,
+            'pos_x': data[5] - sensor_config[0],
+            'pos_y': data[6] - sensor_config[1],
+            'pos_z': - sensor_config[2],
+            'vel_x': data[7],
+            'vel_y': data[8]
+        }
+        return ref_point
+
+    def get_spherical_points(self, obj, sensor_config):
+        dimensions = self.get_actor_size(obj)
+        obj['length'] = dimensions[0]
+        obj['width'] = dimensions[1]
+        spherical = utils.set_compensation(obj)
+        for i in range(0, 3):
+            spherical[i]['distance'] = math.sqrt(spherical[i]['pos_x'] ** 2 + spherical[i]['pos_y'] ** 2
+                                                 + spherical[i]['pos_z'] ** 2)
+            spherical[i]['azimuth'] = math.atan2(spherical[i]['pos_y'], spherical[i]['pos_x'])
+            spherical[i]['elevation'] = math.atan2(math.sqrt(spherical[i]['pos_z'] ** 2 + spherical[i]['distance'] ** 2),
+                                                   spherical[i]['pos_z'])
+            elevation_angle_upper = math.atan2(math.sqrt(spherical[i]['pos_x'] ** 2 + spherical[i]['pos_y'] ** 2), 
+                                               spherical[i]['pos_z'] + spherical[i]['height'])
+            spherical[i]['delta_elevation'] = spherical[i]['elevation'] - elevation_angle_upper
+
+        return spherical
+
+    def calculate_from_points(self, obj, spherical, sensor_config):
+        actor = {}
+        actor['time'] = obj['idx'] * TIME_STEP
+        actor['id'] = obj['id']
+        actor['type'] = obj['type']
+        actor['ref_point'] = obj['ref_point']
+        dimension = self.get_actor_size(obj)
+        actor['length'] = dimension[0]
+        actor['width'] = dimension[1]
+        actor['height'] = dimension[2]
+
+        sensor_radial = math.sqrt(sensor_config[0] ** 2 + sensor_config[1] ** 2 + sensor_config[2] ** 2)
+        sensor_azimuth = math.atan2(sensor_config[1], sensor_config[0])
+        eml = self.collect_ego_signal(obj['idx'], self.ego_generator.signals)
+        sensor_velocity_x = eml[3] - sensor_radial * math.sin(sensor_azimuth) * eml[2]
+        sensor_velocity_y = sensor_radial * math.cos(sensor_azimuth) * eml[2]
+
+        actor['vel_x'] = obj['vel_x'] - sensor_velocity_x
+        actor['vel_y'] = obj['vel_y'] - sensor_velocity_y
+
+        ref_point = utils.min_element(spherical, 'distance')
+        obj_azimuth = math.atan2(ref_point['pos_y'], ref_point['pos_x'])
+        # actor['vel_r'] = actor['vel_x'] * math.cos(obj_azimuth) + actor['vel_y'] * math.sin(obj_azimuth)
+        # actor['vel_t'] = actor['vel_y'] * math.cos(obj_azimuth) - actor['vel_x'] * math.sin(obj_azimuth)
+        
+        actor['yaw'] = self.get_actor_yaw(spherical)
+        position = utils.ref_compensation(obj, actor['yaw'])
+        actor['pos_x'] = position[0]
+        actor['pos_y'] = position[1]
+
+        return actor
+    
+    def get_actor_size(self, obj):
+        
+        dimension = [0.0, 0.0, 0.0] # Width, Length, Height
+        if obj['type'] == 7.0: # passenger car
+            dimension = [2.0, 5.0, 1.5]
+        elif obj['type'] == 3.0: # pedestrian
+            dimension = [1.0, 1.0, 2.0]
+        elif obj['type'] == 4.0: # pedestrian group
+            dimension = [3.0, 3.0, 2.0]
+        elif obj['type'] == 9.0 or obj['type'] == 17.0 or obj['type'] == 18.0: # truck, firefighter, ambulance
+            dimension = [2.5, 10.0, 4.0]
+        elif obj['type'] == 5.0 or obj['type'] == 6.0 or obj['type'] == 10.0: # bicycle, motorcycle, animal
+            dimension = [2.0, 5.0, 1.5]
+        elif obj['type'] == 0.0 : # unknown
+            dimension = [1.5, 1.5, 1.0]
+        else:
+            dimension = [2.0, 5.0, 1.5]
+
+        return dimension
+
+    def get_actor_yaw(self, spherical):
+
+        yaw = 0.0
+        p1, p2 = [0.0, 0.0], [0.0, 0.0]
+        for i in range(0, len(spherical) - 1):
+           for j in range(i, len(spherical)):
+                if utils.points_on_same_side(spherical[i]['type'], spherical[j]['type']):
+                    pts = utils.sort_points(spherical[i], spherical[j], 'front_to_rear')
+                    p1 = utils.polar_to_cartesian(pts[0])
+                    p2 = utils.polar_to_cartesian(pts[1])
+                    yaw = math.atan2(p1[1] - p2[1], p1[0] - p2[0])
+                elif utils.points_on_same_layer(spherical[i]['type'], spherical[j]['type']):
+                    pts = utils.sort_points(spherical[i], spherical[j], 'left_to_right')
+                    p1 = utils.polar_to_cartesian(pts[0])
+                    p2 = utils.polar_to_cartesian(pts[1])
+                    yaw = math.atan2(p1[1] - p2[1], p1[0] - p2[0]) - math.pi / 2
+        
+        return yaw
+    
+    def get_radar_actor(self, data, sensor_config):
+        actor = {
+            'time': data[0] * TIME_STEP,
+            'id': data[1],
+            'type': data[2],
+            'ref_point': data[3],
+            'width': 0.0,
+            'length': 0.0,
+            'height': 0.0,
+            'pos_x': data[6] * math.cos(data[7]) - sensor_config[0],
+            'pos_y': data[6] * math.sin(data[7]) - sensor_config[1],
+            'azimuth': data[7],
+            'yaw': data[8],
+            'vel_r': data[9]
+        }
+        dimension = self.get_actor_size(actor)
+        actor['width'] = dimension[0]
+        actor['length'] = dimension[1]
+        actor['height'] = dimension[2]
+        actor['vel_x'], actor['vel_y'] = self.get_radar_actor_velocity(actor, sensor_config)
+        del actor['azimuth'] 
+        del actor['vel_r']
+        return actor
 
 
+    def get_radar_actor_velocity(self, actor, sensor_config):
+
+        sensor_radial = math.sqrt(sensor_config[0] ** 2 + sensor_config[1] ** 2)
+        sensor_azimuth = math.atan2(sensor_config[1], sensor_config[0])
+        sensor_rotation = sensor_config[2] * math.pi / 180
+        eml = self.collect_ego_signal(int(actor['time']/TIME_STEP), self.ego_generator.signals)
+        sensor_velocity_x = eml[3] - sensor_radial * math.sin(sensor_azimuth) * eml[2]
+        sensor_velocity_y = sensor_radial * math.cos(sensor_azimuth) * eml[2]
+        yaw_s = actor['azimuth'] + sensor_rotation
+        v_sensor_radial = sensor_velocity_x * math.cos(yaw_s) + sensor_velocity_y * math.sin(yaw_s)
+
+        actor_velocity_x, actor_velocity_y = 0.0, 0.0
+        epsilon = 0.01
+        p_cond = math.cos(actor['yaw'] - actor['azimuth'])
+        # If radial velocity is grater than epsilon (grater than 0.01 mps) 
+        # and if target vehicle is not moving perpendicular to ego vehicle 
+        # (perpendicularity condition grater than epsilon)
+        if abs(actor['vel_r']) > epsilon and abs(p_cond) > epsilon:
+            actor_velocity = (actor['vel_r'] + v_sensor_radial) / p_cond
+
+            if abs(actor_velocity) > RADAR_OBJ_MAX_VEL:
+                # Problem in recomputing radar speed. Target is moving approximatively perpendicular to us, 
+                # its absolute speed cannot be computed from radial velocity
+                actor_velocity = 0.0
+            
+            actor_velocity_x = actor_velocity * math.cos(actor['yaw'] + sensor_rotation)
+            actor_velocity_y = actor_velocity * math.sin(actor['yaw'] + sensor_rotation)
+        else:
+            actor_velocity_x = sensor_velocity_x
+            actor_velocity_x = sensor_velocity_y
+
+        return actor_velocity_x, actor_velocity_y
+
+    def get_trajectory_based_on_front(self, actors_path_data):
+        
+        for path in actors_path_data:
+            idx = int(path.iloc[0]['time']/TIME_STEP)
+            ego_trajectory = self.ego_paths[idx]
+            for i in range (0, len(path)):
+                path.iloc[i]['time'] = ego_trajectory.iloc[i]['time']	
+                path.iloc[i]['pos_x'] = path.iloc[i]['pos_x'] + ego_trajectory.iloc[i]['pos_x']
+                path.iloc[i]['pos_y'] = path.iloc[i]['pos_y'] + ego_trajectory.iloc[i]['pos_y']
+                path.iloc[i]['vel_x'] = path.iloc[i]['vel_x'] + ego_trajectory.iloc[i]['vel_t'] * math.cos(ego_trajectory.iloc[i]['yaw'])
+                path.iloc[i]['vel_y'] = path.iloc[i]['vel_y'] + ego_trajectory.iloc[i]['vel_t'] * math.sin(ego_trajectory.iloc[i]['yaw'])
+                path.iloc[i]['yaw'] = path.iloc[i]['yaw'] + ego_trajectory.iloc[i]['yaw']
+
+        return actors_path_data
+
+        
 
 class EMLFromMat:
     def __init__(self):
@@ -205,18 +428,37 @@ class EMLFromMat:
 
 class OGMFromMat:
     def __init__(self):
+        """ Specify signals from mat file that computes OGM mock """
+
+        self.bv2_conf = [
+            ('BV2_Sensor_PositionX', float),
+            ('BV2_Sensor_PositionY', float),
+            ('BV2_Sensor_PositionZ', float)
+        ]
+
         self.bv2_signals = [[
             ('BV2_Obj_{:0>2d}_ID'.format(i), float),
             ('BV2_Obj_{:0>2d}_Klasse'.format(i), float),
+            ('BV2_Obj_{:0>2d}_Bezugspunkt'.format(i), float),
+            ('BV2_Obj_{:0>2d}_Breite'.format(i), float),
             ('BV2_Obj_{:0>2d}_PositionX'.format(i), float),
             ('BV2_Obj_{:0>2d}_PositionY'.format(i), float),
             ('BV2_Obj_{:0>2d}_GeschwX'.format(i), float),
             ('BV2_Obj_{:0>2d}_GeschwY'.format(i), float),
         ] for i in range(1, 11)]
         
+        self.LRR1_conf = [
+            ('LRR1_SensorPos_X', float),
+            ('LRR1_SensorPos_Y', float),
+            ('LRR1_SensorPos_YawStatic', float)
+        ]
+
         self.LRR1_signals = [[
             ('LRR1_Obj_{:0>2d}_ID_UF'.format(i), float),
             ('LRR1_Obj_{:0>2d}_Klasse_UF'.format(i), float),
+            ('LRR1_Obj_{:0>2d}_Bezugspunkt_UF'.format(i), float),
+            ('LRR1_Obj_{:0>2d}_Breite_UF'.format(i), float),
+            ('LRR1_Obj_{:0>2d}_Laenge_UF'.format(i), float),
             ('LRR1_Obj_{:0>2d}_RadialDist_UF'.format(i), float),
             ('LRR1_Obj_{:0>2d}_AzimutWnkl_UF'.format(i), float),
             ('LRR1_Obj_{:0>2d}_GierWnkl_UF'.format(i), float),
@@ -227,5 +469,24 @@ class OGMFromMat:
             'BV2': self.bv2_signals,
             'LRR1': self.LRR1_signals
         }
+
+        self.conf = {
+            'BV2': self.bv2_conf,
+            'LRR1': self.LRR1_conf
+        }
+
+        self.bv2_ogm = {
+            'cartesian':{
+                'ref_point': None, 'width': None, 'length': None, 'height': None,
+                'pos_x': None, 'pos_y': None, 'pos_z': None
+            },
+            'spherical':{
+                'pos_x': None, 'pos_y': None, 'pos_z': None, 'height': None, 'distance': None,
+                'azimuth': None, 'elevation': None, 'delta_elevation': None      
+            }}
+
+
+         
+
 
 
